@@ -38,11 +38,18 @@
 const float CTRL_DT = 1.0f / CTRL_HZ;
 
 // ============================== ROBOT CONSTANTS ==============================
-const float WHEEL_R        = 0.030f;            // m
+// Power: 2x Li-ion cells (7.2 V nominal, 8.4 V full, ~6 V empty) -> TB6612 -> motors; buck converter -> 5 V for the ESP32.
+const float WHEEL_R        = 0.035f;            // m (35 mm wheels)
 const float COUNTS_PER_REV = 341.2f * 4.0f;     // 4x decoding, output shaft
-const float V_FULL         = 4.7f;              // effective motor volts at PWM 255 (MEASURE THIS)
-const float RPM_FULL       = 165.0f;            // measured wheel RPM at PWM 255 on the same battery
-const float KE_FF          = V_FULL / (RPM_FULL * 0.10472f);   // volts per rad/s of wheel speed (back-EMF)
+
+// !!! V_FULL and RPM_FULL MUST BE RE-MEASURED on the 7.2 V pack (run "m 255" with the wheels off the ground):
+//     V_FULL  = voltage across the motor terminals at PWM 255 (battery minus TB6612 drop)
+//     RPM_FULL = steady-state wheel RPM at PWM 255
+// The values below are ESTIMATES that are consistent with the LQR model (Ke = 0.27 V*s/rad); replace them.
+// The LQR works in volts and converts with pwm = u / V_FULL * 255, so a wrong V_FULL scales every LQR gain.
+const float V_FULL         = 6.7f;              // effective motor volts at PWM 255 (ESTIMATE - MEASURE THIS)
+const float RPM_FULL       = 237.0f;            // wheel RPM at PWM 255 on the same battery (ESTIMATE - MEASURE THIS)
+const float KE_FF          = V_FULL / (RPM_FULL * 0.10472f);   // volts per rad/s of wheel speed (back-EMF); ~0.27 expected
 float DB1 = 20.0f;                              // deadband compensation, motor 1 (PWM counts) - tune with: db1 <v>
 float DB2 = 15.0f;                              // deadband compensation, motor 2 - tune with: db2 <v>
 const bool  INVERT_M2 = true;
@@ -74,7 +81,7 @@ const bool YAW_LOOP = false;
 // Arms by itself when the robot is held still at the balance point (the saved one, or the default
 // angleZero if none has been saved). Hold it upright after power-up; send z once to save your own.
 bool  autoArm      = true;
-int   autoArmMode  = 1;                          // 1 = PID, 2 = LQR
+int   autoArmMode  = 1;                          // 1 = PID, 2 = LQR (or send: auto lqr)
 const float AUTO_ARM_DEG  = 2.0f;                // within this many degrees of the balance point...
 const float AUTO_ARM_RATE = 5.0f;                // ...and rotating slower than this (deg/s)...
 const float AUTO_ARM_SEC  = 1.0f;                // ...for this long
@@ -82,7 +89,7 @@ Preferences prefs;
 bool zeroSaved = false;
 
 // ============================== REMOTE DRIVING LIMITS ==============================
-const float V_MAX_CMD      = 0.20f;              // m/s   (top speed at full PWM is ~0.5 m/s; keep headroom to balance)
+const float V_MAX_CMD      = 0.20f;              // m/s   (top speed at full PWM is RPM_FULL*0.10472*WHEEL_R, ~0.87 m/s; keep headroom to balance)
 const float YAW_MAX_CMD    = 90.0f;              // deg/s
 const float V_ACCEL        = 0.5f;               // m/s^2  reference ramp (a sudden step would saturate the motors)
 const float YAW_ACCEL      = 360.0f;             // deg/s^2
@@ -94,9 +101,10 @@ const float KY_I = 1.0f;                         // PWM per degree of accumulate
 // ============================== VELOCITY ESTIMATE ==============================
 #define VEL_WIN 4                                // samples in the finite-difference window (20 ms @ 200 Hz)
 
-// ============================== CONTROLLER GAINS (PLACEHOLDERS - RE-TUNE) ==============================
+// ============================== CONTROLLER GAINS ==============================
 // PID mode: angle PD(+I) with an outer velocity/position loop that offsets the angle setpoint.
 // Rule of thumb: kp*kv should be about 900-1000 PWM per (m/s) - it has to beat the motor back-EMF.
+// (PLACEHOLDERS - still to be re-tuned on the robot)
 float kpA = 28.0f;     // PWM counts per degree
 float kiA = 0.0f;      // PWM counts per degree-second
 float kdA = 0.8f;      // PWM counts per deg/s
@@ -113,7 +121,12 @@ volatile int  recIdx = 0;
 volatile bool recActive = false, recDone = false, recStart = false;
 
 // LQR mode: u = -K (z - zref) + feedforward, z = [x (m), xdot (m/s), theta (rad), thetadot (rad/s)], u in volts
-float K[4] = {-1.6568f, -16.8626f, -17.0784f, -2.1430f};
+// Gains computed from the physical model (discrete LQR at 200 Hz, Q = diag(50, 5, 100, 1), R = 1 V^2) using:
+//   body mass 0.65 kg, wheels 2 x 11 g, wheel radius 35 mm, axle-to-COM l = 80.2 mm,
+//   body inertia about axle 7.394e-3 kg m^2, motor R = 1.88 ohm, Ke = Kt = 0.27 V s/rad,
+//   reflected rotor inertia 3e-4 kg m^2 per motor (estimate).
+// They assume V_FULL / RPM_FULL above are the measured values. Re-tune live with: k <Kx> <Kxd> <Kth> <Kthd>
+float K[4] = {-6.361f, -17.280f, -21.862f, -2.535f};
 
 // ============================== WIFI LINK ==============================
 WiFiServer server(23);
