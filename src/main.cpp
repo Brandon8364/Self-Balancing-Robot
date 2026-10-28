@@ -1,7 +1,7 @@
 // 1-DOF self-balancing robot: ESP32 + MPU6050 + TB6612FNG + 2x FIT0521 encoder motors
 // 200 Hz fixed-rate control task, direct PWM output, selectable PID or LQR controller,
-// WiFi access point + TCP command/telemetry link, remote driving (speed + turn) on top of balancing,
-// saved balance point (survives reboot), auto-arming for untethered use, and tuning tools
+// WiFi access point + TCP command/telemetry link, ESP-NOW remote driving (speed + turn) on top of balancing,
+// saved balance point (survives reboot), auto-arming at power-up, and tuning tools
 // (live deadband / D-term filter commands and a 2 s, 200 Hz data recorder).
 // Arduino-ESP32 core 2.x API (ledcSetup / ledcAttachPin), PlatformIO.
 //
@@ -14,6 +14,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <esp_now.h>
 
 // ============================== PINS ==============================
 #define PWMA 25
@@ -69,8 +70,9 @@ const float ARM_MAX_RATE = 20.0f;                // deg/s, must be nearly still 
 // Leave OFF until balancing works. Turn on after checking YAW_AXIS / YAW_SIGN with the "w" command.
 const bool YAW_LOOP = false;
 
-// ============================== AUTO-ARM (untethered use) ==============================
-// Arms by itself when the robot is held still at the SAVED balance point (send z once, tethered).
+// ============================== AUTO-ARM (starts balancing at power-up) ==============================
+// Arms by itself when the robot is held still at the balance point (the saved one, or the default
+// angleZero if none has been saved). Hold it upright after power-up; send z once to save your own.
 bool  autoArm      = true;
 int   autoArmMode  = 1;                          // 1 = PID, 2 = LQR
 const float AUTO_ARM_DEG  = 2.0f;                // within this many degrees of the balance point...
@@ -265,6 +267,38 @@ volatile uint32_t lastCmdMs = 0;
 volatile uint32_t periodUsMax = 0, periodUsMin = 0xFFFFFFFF, loopUsMax = 0;
 volatile bool  imuOk = false;
 
+// ============================== ESP-NOW CONTROLLER LINK ==============================
+typedef struct control_packet {      // must match the controller's struct exactly
+  int16_t throttle;                  // -100..100
+  int16_t steering;                  // -100..100
+  bool buttonPressed;
+} control_packet;
+
+volatile bool lastButton = false;
+volatile uint32_t rxCount = 0, rxLastMs = 0;     // link diagnostics (print with the "link" command)
+volatile int16_t rxThr = 0, rxSte = 0;
+volatile bool rxBtn = false;
+
+void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len != sizeof(control_packet)) return;
+  control_packet p;
+  memcpy(&p, data, sizeof(p));
+
+  rxCount++; rxLastMs = millis();
+  rxThr = p.throttle; rxSte = p.steering; rxBtn = p.buttonPressed;
+
+  float t = constrain((int)p.throttle, -100, 100) / 100.0f;
+  float s = constrain((int)p.steering, -100, 100) / 100.0f;
+  vTarget   = t * V_MAX_CMD;         // flip the sign here if forward stick drives it backwards
+  yawTarget = s * YAW_MAX_CMD;
+  lastCmdMs = millis();              // feeds the existing 500 ms link-loss timeout
+
+  if (p.buttonPressed && !lastButton) {   // button = emergency stop (rising edge)
+    mode = IDLE; vTarget = 0; yawTarget = 0;
+  }
+  lastButton = p.buttonPressed;
+}
+
 // ============================== CONTROL STEP (runs at CTRL_HZ) ==============================
 void controlStep() {
   static uint32_t lastUs = 0;
@@ -337,8 +371,8 @@ void controlStep() {
   float xAbs   = WHEEL_R * (phi + thRad);        // ground position (encoder angle is relative to the body)
   float xdAbs  = WHEEL_R * (phiDot + thdRad);
 
-  // ---- 2b. auto-arm: held still at the saved balance point ----
-  if (autoArm && zeroSaved && mode == IDLE && imuOk && angleInit && calRequest == 0 && armRequest == 0) {
+  // ---- 2b. auto-arm: held still at the balance point ----
+  if (autoArm && mode == IDLE && imuOk && angleInit && calRequest == 0 && armRequest == 0) {
     if (fabsf(theta) < AUTO_ARM_DEG && fabsf(thetaRate) < AUTO_ARM_RATE) stillTime += dt;
     else stillTime = 0;
     if (stillTime > AUTO_ARM_SEC) { armRequest = autoArmMode; stillTime = 0; }
@@ -501,6 +535,10 @@ void handleCommand(String s) {
     prefs.putFloat("zero", angleZero);
     zeroSaved = true;
     Out.println("Balance point saved.");
+  } else if (s == "link") {                        // ESP-NOW remote diagnostics
+    Out.printf("LINK: rx=%lu age=%lu ms thr=%d ste=%d btn=%d vTarget=%.3f yawTarget=%.1f\n",
+               (unsigned long)rxCount, (unsigned long)(millis() - rxLastMs),
+               (int)rxThr, (int)rxSte, (int)rxBtn, (float)vTarget, (float)yawTarget);
   } else if (s == "rec") {
     recStart = true;
     Out.println("Recording 2 s at 200 Hz (keep it balancing)...");
@@ -553,6 +591,7 @@ void pumpInput(Stream &s, String &buf) {
 // ============================== SETUP / LOOP ==============================
 void setup() {
   Serial.begin(115200);
+  delay(1500);   // time to put the robot down and hold it still for gyro calibration
 
   prefs.begin("bot", false);
   float savedZero = prefs.getFloat("zero", 999.0f);
@@ -561,7 +600,8 @@ void setup() {
     zeroSaved = true;
     Serial.printf("Saved balance point loaded: %.2f deg\n", savedZero);
   } else {
-    Serial.println("No balance point saved: hold the robot at balance and send z (auto-arm stays off until then).");
+    Serial.printf("No balance point saved: using default %.2f deg. Hold the robot at balance and send z to save yours.\n",
+                  (float)angleZero);
   }
 
   pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
@@ -589,16 +629,23 @@ void setup() {
   }
 
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("balancebot", "balance123");       // password must be 8+ characters
+  WiFi.softAP("balancebot", "balance123", 1);    // fixed channel 1 so the controller matches
   server.begin();
   server.setNoDelay(true);
-  Serial.println("WiFi AP 'balancebot' up: connect, then open TCP 192.168.4.1 port 23");
+
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb(onEspNowRecv);
+    Serial.print("ESP-NOW ready. Robot MAC for the controller: ");
+    Serial.println(WiFi.softAPmacAddress());
+  } else {
+    Serial.println("ESP-NOW init failed.");
+  }
 
   // Control task: above the lwIP task, on core 1 (WiFi driver tasks run on core 0)
   xTaskCreatePinnedToCore(controlTask, "ctrl", 6144, NULL, 19, NULL, 1);
 
   Serial.println("Commands: pid | lqr (arm) | s (stop) | z (set + save balance point) | cal | auto pid/lqr/off | d <m/s> <deg/s> (drive)");
-  Serial.println("          m <pwm> / w <pwm> (2 s bench tests) | kp/ki/kd/kv/kx <v> | k <Kx> <Kxd> <Kth> <Kthd> | p | log 0/1");
+  Serial.println("          m <pwm> / w <pwm> (2 s bench tests) | kp/ki/kd/kv/kx <v> | k <Kx> <Kxd> <Kth> <Kthd> | p | log 0/1 | link");
   Serial.println("          tuning: db1 <v> | db2 <v> | kf <0.05-1> (D filter, 1 = off) | rec (record 2 s, then prints it)");
   Serial.println("          balance point: zo <deg> (nudge, live) | zs (save)");
   Serial.println("CSV: t_ms,mode,theta_deg,rate_dps,x_m,xdot_mps,vref_mps,pwm,yaw_dps,period_us_min,period_us_max,loop_us_max");
