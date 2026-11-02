@@ -5,6 +5,17 @@
 // (live deadband / D-term filter commands and a 2 s, 200 Hz data recorder).
 // Arduino-ESP32 core 2.x API (ledcSetup / ledcAttachPin), PlatformIO.
 //
+// CHANGES IN THIS VERSION (jitter / supply-voltage fixes):
+//   1. Battery-voltage compensation: feedback output is scaled by V_TUNE / vbat so loop gain stays constant
+//      as the pack sags. Optional: needs a divider on GPIO34 (free pin, no pin changes). If VBAT_SENSE is
+//      false the code assumes V_TUNE and behaves like before (scale = 1).
+//   2. Motor voltage cap (MOTOR_V_LIMIT) so 6 V motors never see the full 8.4 V of a fresh pack.
+//   3. Deadband: wider ramp (DB_RAMP) so the effective gain near zero is no longer ~3x, and the deadband
+//      is scaled with battery voltage.
+//   4. Velocity estimate has an extra low-pass (velAlpha, command "kvf") to hide encoder quantization.
+//   5. D-term filter on by default (rateAlpha = 0.4), kx reduced (slow rocking), COMP_TAU 0.5 s.
+//   6. New commands: vb (print battery), vbat <v> (set assumed voltage when not sensing), kvf <a>, dbr <n>.
+//
 // Sign conventions (check these on the bench before balancing):
 //   theta  > 0 : robot leaning toward the direction the wheels drive when PWM is positive
 //   x, xdot > 0: robot moving in that same direction
@@ -33,9 +44,23 @@
 #define SDA_PIN 21
 #define SCL_PIN 22
 
+#define VBAT_PIN 34                              // free, input-only ADC1 pin (ADC2 is unusable with WiFi on)
+
 // ============================== LOOP RATE ==============================
 #define CTRL_HZ 200
 const float CTRL_DT = 1.0f / CTRL_HZ;
+
+// ============================== BATTERY / VOLTAGE COMPENSATION ==============================
+// Optional battery sensing: divider from battery+ to GPIO34, e.g. 100k (top) + 47k (bottom to GND),
+// which gives ~2.7 V at 8.4 V. Add a 100 nF cap from GPIO34 to GND. Then set VBAT_SENSE = true.
+// With VBAT_SENSE = false nothing is read and vbat is fixed at V_TUNE (compensation does nothing,
+// the voltage cap still applies).
+const bool  VBAT_SENSE   = false;
+const float VBAT_DIV     = (100.0f + 47.0f) / 47.0f;   // Vbat = Vpin * VBAT_DIV   (adjust to your resistors)
+const float VBAT_CAL     = 1.00f;                      // fine trim: measured pack V / reported V (use "vb")
+const float V_TUNE       = 7.2f;                       // battery volts at which gains were tuned AND V_FULL/RPM_FULL measured
+const float MOTOR_V_LIMIT = 6.5f;                      // max average volts allowed at the motors (6 V rated, small margin)
+volatile float vbat = V_TUNE;                          // filtered battery volts
 
 // ============================== ROBOT CONSTANTS ==============================
 // Power: 2x Li-ion cells (7.2 V nominal, 8.4 V full, ~6 V empty) -> TB6612 -> motors; buck converter -> 5 V for the ESP32.
@@ -45,13 +70,14 @@ const float COUNTS_PER_REV = 341.2f * 4.0f;     // 4x decoding, output shaft
 // !!! V_FULL and RPM_FULL MUST BE RE-MEASURED on the 7.2 V pack (run "m 255" with the wheels off the ground):
 //     V_FULL  = voltage across the motor terminals at PWM 255 (battery minus TB6612 drop)
 //     RPM_FULL = steady-state wheel RPM at PWM 255
-// The values below are ESTIMATES that are consistent with the LQR model (Ke = 0.27 V*s/rad); replace them.
-// The LQR works in volts and converts with pwm = u / V_FULL * 255, so a wrong V_FULL scales every LQR gain.
+// Both are defined AT a battery voltage of V_TUNE; at other voltages V_FULL scales with vbat / V_TUNE.
+// The LQR works in volts and converts with pwm = u / vFullNow * 255, so a wrong V_FULL scales every LQR gain.
 const float V_FULL         = 6.7f;              // effective motor volts at PWM 255 (ESTIMATE - MEASURE THIS)
 const float RPM_FULL       = 237.0f;            // wheel RPM at PWM 255 on the same battery (ESTIMATE - MEASURE THIS)
 const float KE_FF          = V_FULL / (RPM_FULL * 0.10472f);   // volts per rad/s of wheel speed (back-EMF); ~0.27 expected
-float DB1 = 20.0f;                              // deadband compensation, motor 1 (PWM counts) - tune with: db1 <v>
-float DB2 = 15.0f;                              // deadband compensation, motor 2 - tune with: db2 <v>
+float DB1 = 20.0f;                              // deadband compensation, motor 1 (PWM counts at V_TUNE) - tune with: db1 <v>
+float DB2 = 20.0f;                              // deadband compensation, motor 2 - tune with: db2 <v>
+float DB_RAMP = 70.0f;                          // PWM counts over which the deadband ramps in (bigger = smoother, less gain near 0). dbr <v>
 const bool  INVERT_M2 = true;
 
 #define PWM_CH1 0
@@ -65,7 +91,7 @@ const float PWM_MAXCNT = 1023.0f;
 #define YAW_AXIS  2                              // board axis that points up when balanced: 0=X 1=Y 2=Z
 const float IMU_SIGN = 1.0f;                     // flip to -1.0f if angle sign is backwards
 const float YAW_SIGN = 1.0f;                     // flip so "w 40" gives a positive yaw rate in the telemetry
-const float COMP_TAU = 1.0f;                     // complementary filter time constant (s)
+const float COMP_TAU = 0.5f;                     // complementary filter time constant (s) (was 1.0)
 
 // ============================== SAFETY ==============================
 const float CUTOFF_DEG   = 25.0f;                // motors stop beyond this tilt
@@ -100,18 +126,20 @@ const float KY_I = 1.0f;                         // PWM per degree of accumulate
 
 // ============================== VELOCITY ESTIMATE ==============================
 #define VEL_WIN 4                                // samples in the finite-difference window (20 ms @ 200 Hz)
+float velAlpha = 0.35f;                          // extra low-pass on wheel speed: 1.0 = off, smaller = smoother. Tune with: kvf <0.05..1>
+float velF = 0;                                  // filtered wheel angular speed (rad/s)
 
 // ============================== CONTROLLER GAINS ==============================
 // PID mode: angle PD(+I) with an outer velocity/position loop that offsets the angle setpoint.
 // Rule of thumb: kp*kv should be about 900-1000 PWM per (m/s) - it has to beat the motor back-EMF.
 // (PLACEHOLDERS - still to be re-tuned on the robot)
-float kpA = 28.0f;     // PWM counts per degree
+float kpA = 28.0f;     // PWM counts per degree (at V_TUNE; scaled automatically with battery voltage)
 float kiA = 0.0f;      // PWM counts per degree-second
 float kdA = 0.8f;      // PWM counts per deg/s
 float kvA = 28.0f;     // degrees of lean per (m/s) of speed error
-float kxA = 20.0f;     // degrees of lean per metre of position error (stops slow drift from a small balance-point error)
+float kxA = 8.0f;      // degrees of lean per metre of position error (was 20; lower = less slow rocking)
 const float REF_MAX_DEG = 8.0f;
-float rateAlpha = 1.0f;     // D-term low-pass: 1.0 = off, smaller = more filtering. Tune with: kf <0.05..1>
+float rateAlpha = 0.4f;     // D-term low-pass: 1.0 = off, smaller = more filtering. Tune with: kf <0.05..1>
 float rateF = 0;            // filtered tilt rate used by the D term (PID mode)
 
 // Data recorder: 'rec' captures 2 s at the full control rate, then prints it as CSV
@@ -176,13 +204,24 @@ void writeMotor(int in1, int in2, int ch, float pwm) {
 void setMotor1(float pwm) { writeMotor(AIN1, AIN2, PWM_CH1, pwm); }
 void setMotor2(float pwm) { writeMotor(BIN1, BIN2, PWM_CH2, INVERT_M2 ? -pwm : pwm); }
 
-// Smooth deadband compensation: skips the dead zone but ramps in near zero to avoid chatter
-float withDeadband(float p, float db) {
+// Smooth deadband compensation: skips the dead zone but ramps in over DB_RAMP counts to avoid chatter.
+// db is already scaled for battery voltage; lim is the voltage-cap in PWM counts.
+// Slope near zero is db/DB_RAMP + (1 - db/255), i.e. about 1.7x for db=20, ramp=25 (was ~3.4x with ramp=8).
+float withDeadband(float p, float db, float lim) {
   float a = fabsf(p);
   if (a < 0.5f) return 0.0f;
-  float mag = db * fminf(a / 8.0f, 1.0f) + a * (255.0f - db) / 255.0f;
-  mag = fminf(mag, 255.0f);
+  float mag = db * fminf(a / DB_RAMP, 1.0f) + a * (255.0f - db) / 255.0f;
+  mag = fminf(mag, lim);
   return (p > 0) ? mag : -mag;
+}
+
+// ============================== BATTERY ==============================
+void updateBattery() {
+  if (!VBAT_SENSE) return;
+  float mv = analogReadMilliVolts(VBAT_PIN);               // calibrated millivolts at the pin
+  float v = mv * 0.001f * VBAT_DIV * VBAT_CAL;
+  if (v < 3.0f || v > 12.0f) return;                       // implausible (divider missing?) - keep last value
+  vbat += 0.05f * (v - vbat);                              // slow filter, updated at 10 Hz (~2 s time constant)
 }
 
 // ============================== IMU ==============================
@@ -325,6 +364,7 @@ void controlStep() {
   static float xOffset = 0, pidInt = 0, yawInt = 0;
   static float vRef = 0, yawRef = 0, xRef = 0;
   static float stillTime = 0;
+  static int vbatDiv = 0;
 
   uint32_t nowUs = micros();
   float dt = CTRL_DT;
@@ -335,6 +375,13 @@ void controlStep() {
     dt = constrain(per * 1e-6f, 0.5f * CTRL_DT, 2.0f * CTRL_DT);
   }
   lastUs = nowUs;
+
+  // ---- 0. battery voltage and the quantities derived from it (10 Hz sample) ----
+  if (++vbatDiv >= CTRL_HZ / 10) { vbatDiv = 0; updateBattery(); }
+  float vb = vbat;
+  float vScale   = V_TUNE / vb;                    // keeps loop gain constant as the pack sags
+  float vFullNow = V_FULL * vb / V_TUNE;           // motor volts at PWM 255 right now
+  float pwmLimit = fminf(255.0f, 255.0f * MOTOR_V_LIMIT / vFullNow);   // never exceed MOTOR_V_LIMIT at the motors
 
   // ---- 1. IMU: complementary filter ----
   if (imuOk) {
@@ -377,7 +424,9 @@ void controlStep() {
   if (!bufInit) { for (int i = 0; i <= VEL_WIN; i++) phiBuf[i] = phi; bufInit = true; }
   phiBuf[bufIdx] = phi;
   bufIdx = (bufIdx + 1) % (VEL_WIN + 1);
-  float phiDot = (phi - phiBuf[bufIdx]) / (VEL_WIN * CTRL_DT);
+  float phiDotRaw = (phi - phiBuf[bufIdx]) / (VEL_WIN * CTRL_DT);
+  velF += velAlpha * (phiDotRaw - velF);         // low-pass hides one-count quantization steps
+  float phiDot = velF;
 
   float thRad  = theta * 0.0174533f;
   float thdRad = thetaRate * 0.0174533f;
@@ -421,7 +470,7 @@ void controlStep() {
     vGoal = vTarget;
     yawGoal = yawTarget;
   }
-  if (fabsf(pwmOut) > 0.85f * 255.0f) vGoal = 0;      // near saturation: stop asking for more speed
+  if (fabsf(pwmOut) > 0.85f * pwmLimit) vGoal = 0;    // near saturation: stop asking for more speed
   vRef   += constrain(vGoal - vRef,     -V_ACCEL * dt,   V_ACCEL * dt);
   yawRef += constrain(yawGoal - yawRef, -YAW_ACCEL * dt, YAW_ACCEL * dt);
   if (mode == IDLE) { vRef = 0; yawRef = 0; }
@@ -438,12 +487,13 @@ void controlStep() {
     float e = theta - thRef;
     pidInt += e * dt;
     if (kiA > 0.0f) pidInt = constrain(pidInt, -40.0f / kiA, 40.0f / kiA);
-    pwmCmd = kpA * e + kiA * pidInt + kdA * rateF + ffV / V_FULL * 255.0f;
+    float fb = kpA * e + kiA * pidInt + kdA * rateF;          // feedback, tuned at V_TUNE
+    pwmCmd = fb * vScale + ffV / vFullNow * 255.0f;           // scaled for battery; feedforward is already in volts
   } else if (mode == LQR_MODE) {
     float u = -(K[0] * (x - xRef) + K[1] * (xdAbs - vRef) + K[2] * thRad + K[3] * thdRad) + ffV;   // volts
-    pwmCmd = u / V_FULL * 255.0f;
+    pwmCmd = u / vFullNow * 255.0f;                           // volts -> PWM using the CURRENT battery voltage
   }
-  pwmCmd = constrain(pwmCmd, -255.0f, 255.0f);
+  pwmCmd = constrain(pwmCmd, -pwmLimit, pwmLimit);
 
   if (recStart) { recStart = false; recIdx = 0; recActive = true; }
   if (recActive) {
@@ -455,7 +505,8 @@ void controlStep() {
   float steer = 0;
   if (mode != IDLE && YAW_LOOP) {
     float yawErr = yawRef - yawRate;
-    float steerMax = fminf(STEER_MAX, 255.0f - fabsf(pwmCmd));   // balance has priority over turning
+    float steerMax = fminf(STEER_MAX, pwmLimit - fabsf(pwmCmd));   // balance has priority over turning
+    if (steerMax < 0) steerMax = 0;
     yawInt += yawErr * dt;
     yawInt = constrain(yawInt, -STEER_MAX / KY_I, STEER_MAX / KY_I);
     steer = constrain(KY_P * yawErr + KY_I * yawInt, -steerMax, steerMax);
@@ -465,11 +516,12 @@ void controlStep() {
 
   // ---- 8. outputs ----
   if (mode != IDLE) {
-    setMotor1(withDeadband(pwmCmd + steer, DB1));
-    setMotor2(withDeadband(pwmCmd - steer, DB2));
+    float db1 = DB1 * vScale, db2 = DB2 * vScale;             // a fixed-voltage deadband is fewer counts on a fuller pack
+    setMotor1(withDeadband(pwmCmd + steer, db1, pwmLimit));
+    setMotor2(withDeadband(pwmCmd - steer, db2, pwmLimit));
     pwmOut = pwmCmd;
   } else {
-    bool testing = millis() < testUntilMs;       // bench test: raw PWM for a short time
+    bool testing = millis() < testUntilMs;       // bench test: raw PWM for a short time (NOT voltage-capped, so "m 255" works)
     float p  = testing ? testPwm : 0.0f;
     float st = testing ? testSteer : 0.0f;
     setMotor1(p + st);
@@ -493,8 +545,9 @@ void controlTask(void *) {
 
 // ============================== COMMANDS ==============================
 void printGains() {
-  Out.printf("PID: kp=%.2f ki=%.2f kd=%.2f kv=%.2f kx=%.2f | LQR K=[%.4f %.4f %.4f %.4f] | zero=%.2f deg | DB1=%.0f DB2=%.0f kf=%.2f\n",
-             kpA, kiA, kdA, kvA, kxA, K[0], K[1], K[2], K[3], (float)angleZero, DB1, DB2, rateAlpha);
+  Out.printf("PID: kp=%.2f ki=%.2f kd=%.2f kv=%.2f kx=%.2f | LQR K=[%.4f %.4f %.4f %.4f] | zero=%.2f deg | DB1=%.0f DB2=%.0f dbr=%.0f kf=%.2f kvf=%.2f | vbat=%.2f (%s)\n",
+             kpA, kiA, kdA, kvA, kxA, K[0], K[1], K[2], K[3], (float)angleZero, DB1, DB2, DB_RAMP, rateAlpha, velAlpha,
+             (float)vbat, VBAT_SENSE ? "sensed" : "assumed");
 }
 
 bool logOn = true;
@@ -555,9 +608,19 @@ void handleCommand(String s) {
   } else if (s == "rec") {
     recStart = true;
     Out.println("Recording 2 s at 200 Hz (keep it balancing)...");
+  } else if (s == "vb") {                          // battery diagnostics
+    float vFullNow = V_FULL * (float)vbat / V_TUNE;
+    Out.printf("VBAT: %.2f V (%s) | gain scale %.2f | motor V at full PWM %.2f | PWM limit %.0f of 255 (cap %.1f V)\n",
+               (float)vbat, VBAT_SENSE ? "sensed" : "assumed", V_TUNE / (float)vbat, vFullNow,
+               fminf(255.0f, 255.0f * MOTOR_V_LIMIT / vFullNow), MOTOR_V_LIMIT);
+  } else if (s.startsWith("vbat ")) {              // when not sensing: tell the code what the pack is at (e.g. "vbat 8.0")
+    if (VBAT_SENSE) Out.println("Battery is sensed; this command only applies when VBAT_SENSE is false.");
+    else { vbat = constrain(s.substring(5).toFloat(), 5.0f, 9.0f); printGains(); }
   } else if (s.startsWith("db1 ")) { DB1 = constrain(s.substring(4).toFloat(), 0.0f, 80.0f); printGains();
   } else if (s.startsWith("db2 ")) { DB2 = constrain(s.substring(4).toFloat(), 0.0f, 80.0f); printGains();
+  } else if (s.startsWith("dbr ")) { DB_RAMP = constrain(s.substring(4).toFloat(), 4.0f, 80.0f); printGains();
   } else if (s.startsWith("kf "))  { rateAlpha = constrain(s.substring(3).toFloat(), 0.05f, 1.0f); printGains();
+  } else if (s.startsWith("kvf ")) { velAlpha = constrain(s.substring(4).toFloat(), 0.05f, 1.0f); printGains();
   } else if (s == "p") {
     printGains();
   } else if (s.startsWith("log")) {
@@ -633,6 +696,19 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC2_A), isr2, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC2_B), isr2, CHANGE);
 
+  if (VBAT_SENSE) {
+    analogSetPinAttenuation(VBAT_PIN, ADC_11db);          // 0..~3.1 V input range
+    pinMode(VBAT_PIN, INPUT);
+    // seed the filter with a real reading so the first seconds are not wrong
+    float sum = 0; int n = 0;
+    for (int i = 0; i < 16; i++) { sum += analogReadMilliVolts(VBAT_PIN); n++; delay(2); }
+    float v = (sum / n) * 0.001f * VBAT_DIV * VBAT_CAL;
+    if (v > 3.0f && v < 12.0f) vbat = v;
+    Serial.printf("Battery sensed: %.2f V\n", (float)vbat);
+  } else {
+    Serial.printf("Battery sensing OFF: assuming %.2f V (set with: vbat <v>).\n", (float)vbat);
+  }
+
   imuOk = mpuInit();
   if (imuOk) {
     Serial.println("IMU found. Keep the robot still - calibrating gyro (2 s)...");
@@ -659,9 +735,10 @@ void setup() {
 
   Serial.println("Commands: pid | lqr (arm) | s (stop) | z (set + save balance point) | cal | auto pid/lqr/off | d <m/s> <deg/s> (drive)");
   Serial.println("          m <pwm> / w <pwm> (2 s bench tests) | kp/ki/kd/kv/kx <v> | k <Kx> <Kxd> <Kth> <Kthd> | p | log 0/1 | link");
-  Serial.println("          tuning: db1 <v> | db2 <v> | kf <0.05-1> (D filter, 1 = off) | rec (record 2 s, then prints it)");
+  Serial.println("          tuning: db1 <v> | db2 <v> | dbr <ramp> | kf <0.05-1> (D filter) | kvf <0.05-1> (speed filter) | rec (record 2 s)");
+  Serial.println("          battery: vb (status) | vbat <v> (assumed volts when VBAT_SENSE is false)");
   Serial.println("          balance point: zo <deg> (nudge, live) | zs (save)");
-  Serial.println("CSV: t_ms,mode,theta_deg,rate_dps,x_m,xdot_mps,vref_mps,pwm,yaw_dps,period_us_min,period_us_max,loop_us_max");
+  Serial.println("CSV: t_ms,mode,theta_deg,rate_dps,x_m,xdot_mps,vref_mps,pwm,yaw_dps,period_us_min,period_us_max,loop_us_max,vbat");
 }
 
 void loop() {
@@ -696,10 +773,10 @@ void loop() {
   uint32_t now = millis();
   if (logOn && now - lastPrint >= 40) {        // 25 Hz telemetry
     lastPrint = now;
-    Out.printf("%lu,%d,%.2f,%.1f,%.3f,%.3f,%.3f,%.0f,%.1f,%lu,%lu,%lu\n",
+    Out.printf("%lu,%d,%.2f,%.1f,%.3f,%.3f,%.3f,%.0f,%.1f,%lu,%lu,%lu,%.2f\n",
                (unsigned long)now, (int)mode, (float)theta, (float)thetaRate,
                (float)xPos, (float)xVel, (float)vRefOut, (float)pwmOut, (float)yawRate,
-               (unsigned long)periodUsMin, (unsigned long)periodUsMax, (unsigned long)loopUsMax);
+               (unsigned long)periodUsMin, (unsigned long)periodUsMax, (unsigned long)loopUsMax, (float)vbat);
     periodUsMin = 0xFFFFFFFF; periodUsMax = 0; loopUsMax = 0;
   }
   delay(2);
