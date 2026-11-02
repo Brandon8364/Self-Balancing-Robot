@@ -15,6 +15,10 @@
 //   4. Velocity estimate has an extra low-pass (velAlpha, command "kvf") to hide encoder quantization.
 //   5. D-term filter on by default (rateAlpha = 0.4), kx reduced (slow rocking), COMP_TAU 0.5 s.
 //   6. New commands: vb (print battery), vbat <v> (set assumed voltage when not sensing), kvf <a>, dbr <n>.
+//   7. Per-motor bench tests: m1 <pwm> / m2 <pwm> drive ONE motor for 2 s (idle mode only) so each
+//      motor's breakaway can be measured separately. m and w still drive both motors.
+//   8. LQR mode now uses the same low-pass-filtered tilt rate as the PID D term (rateF, command "kf") for the
+//      K[3] term, so PID and LQR see the same rate signal. Set "kf 1" to get the old raw-gyro behaviour.
 //
 // Sign conventions (check these on the bench before balancing):
 //   theta  > 0 : robot leaning toward the direction the wheels drive when PWM is positive
@@ -75,8 +79,8 @@ const float COUNTS_PER_REV = 341.2f * 4.0f;     // 4x decoding, output shaft
 const float V_FULL         = 6.7f;              // effective motor volts at PWM 255 (ESTIMATE - MEASURE THIS)
 const float RPM_FULL       = 237.0f;            // wheel RPM at PWM 255 on the same battery (ESTIMATE - MEASURE THIS)
 const float KE_FF          = V_FULL / (RPM_FULL * 0.10472f);   // volts per rad/s of wheel speed (back-EMF); ~0.27 expected
-float DB1 = 20.0f;                              // deadband compensation, motor 1 (PWM counts at V_TUNE) - tune with: db1 <v>
-float DB2 = 20.0f;                              // deadband compensation, motor 2 - tune with: db2 <v>
+float DB1 = 0.0f;                             // deadband compensation, motor 1 (PWM counts at V_TUNE) - tune with: db1 <v>
+float DB2 = 0.0f;                             // deadband compensation, motor 2 - tune with: db2 <v>
 float DB_RAMP = 70.0f;                          // PWM counts over which the deadband ramps in (bigger = smoother, less gain near 0). dbr <v>
 const bool  INVERT_M2 = true;
 
@@ -141,6 +145,8 @@ float kxA = 8.0f;      // degrees of lean per metre of position error (was 20; l
 const float REF_MAX_DEG = 8.0f;
 float rateAlpha = 0.4f;     // D-term low-pass: 1.0 = off, smaller = more filtering. Tune with: kf <0.05..1>
 float rateF = 0;            // filtered tilt rate used by the D term (PID mode)
+volatile bool filtVel = true;   // LQR: use the filtered tilt rate inside the velocity term too (command: xf 0/1)
+#define BUILD_TAG "v10-k07"      // shown in the p line so you can tell which build is running
 
 // Data recorder: 'rec' captures 2 s at the full control rate, then prints it as CSV
 #define REC_N 400
@@ -154,7 +160,7 @@ volatile bool recActive = false, recDone = false, recStart = false;
 //   body inertia about axle 7.394e-3 kg m^2, motor R = 1.88 ohm, Ke = Kt = 0.27 V s/rad,
 //   reflected rotor inertia 3e-4 kg m^2 per motor (estimate).
 // They assume V_FULL / RPM_FULL above are the measured values. Re-tune live with: k <Kx> <Kxd> <Kth> <Kthd>
-float K[4] = {-6.361f, -17.280f, -21.862f, -2.535f};
+float K[4] = {-4.12f, -14.42f, -29.5f, -0.84f};   // 0.7 x the PID-equivalent gains; stopped the 12.5 Hz buzz in bench tests (with kf 0.4, xf 1, db 0). Old model-based K: {-6.361, -17.280, -21.862, -2.535}
 
 // ============================== WIFI LINK ==============================
 WiFiServer server(23);
@@ -313,6 +319,7 @@ volatile int   armReply = 0;          // 1 armed, 2 too far from balance, 3 movi
 volatile bool  cutoffFlag = false, faultFlag = false, calDone = false;
 volatile int   calRequest = 0;        // samples remaining for gyro calibration
 volatile float testPwm = 0, testSteer = 0;
+volatile int   testMask = 3;          // bench tests: bit0 = motor 1, bit1 = motor 2 (3 = both)
 volatile uint32_t testUntilMs = 0;
 volatile float vTarget = 0, yawTarget = 0;      // remote drive commands
 volatile uint32_t lastCmdMs = 0;
@@ -490,7 +497,9 @@ void controlStep() {
     float fb = kpA * e + kiA * pidInt + kdA * rateF;          // feedback, tuned at V_TUNE
     pwmCmd = fb * vScale + ffV / vFullNow * 255.0f;           // scaled for battery; feedforward is already in volts
   } else if (mode == LQR_MODE) {
-    float u = -(K[0] * (x - xRef) + K[1] * (xdAbs - vRef) + K[2] * thRad + K[3] * thdRad) + ffV;   // volts
+    float thdFilt = rateF * 0.0174533f;                       // same low-pass as the PID D term (kf)
+    float xdUse = filtVel ? WHEEL_R * (phiDot + thdFilt) : xdAbs;   // xf 1 (default): velocity term also uses the filtered rate; xf 0: raw gyro as before
+    float u = -(K[0] * (x - xRef) + K[1] * (xdUse - vRef) + K[2] * thRad + K[3] * thdFilt) + ffV;   // volts
     pwmCmd = u / vFullNow * 255.0f;                           // volts -> PWM using the CURRENT battery voltage
   }
   pwmCmd = constrain(pwmCmd, -pwmLimit, pwmLimit);
@@ -524,8 +533,9 @@ void controlStep() {
     bool testing = millis() < testUntilMs;       // bench test: raw PWM for a short time (NOT voltage-capped, so "m 255" works)
     float p  = testing ? testPwm : 0.0f;
     float st = testing ? testSteer : 0.0f;
-    setMotor1(p + st);
-    setMotor2(p - st);
+    int mask = testMask;                         // which motor(s) the bench test drives
+    setMotor1((mask & 1) ? (p + st) : 0.0f);
+    setMotor2((mask & 2) ? (p - st) : 0.0f);
     pwmOut = p;
     pidInt = 0;
   }
@@ -545,9 +555,9 @@ void controlTask(void *) {
 
 // ============================== COMMANDS ==============================
 void printGains() {
-  Out.printf("PID: kp=%.2f ki=%.2f kd=%.2f kv=%.2f kx=%.2f | LQR K=[%.4f %.4f %.4f %.4f] | zero=%.2f deg | DB1=%.0f DB2=%.0f dbr=%.0f kf=%.2f kvf=%.2f | vbat=%.2f (%s)\n",
-             kpA, kiA, kdA, kvA, kxA, K[0], K[1], K[2], K[3], (float)angleZero, DB1, DB2, DB_RAMP, rateAlpha, velAlpha,
-             (float)vbat, VBAT_SENSE ? "sensed" : "assumed");
+  Out.printf("PID: kp=%.2f ki=%.2f kd=%.2f kv=%.2f kx=%.2f | LQR K=[%.4f %.4f %.4f %.4f] | zero=%.2f deg | DB1=%.0f DB2=%.0f dbr=%.0f kf=%.2f kvf=%.2f xf=%d | vbat=%.2f (%s) | build %s\n",
+             kpA, kiA, kdA, kvA, kxA, K[0], K[1], K[2], K[3], (float)angleZero, DB1, DB2, DB_RAMP, rateAlpha, velAlpha, (int)filtVel,
+             (float)vbat, VBAT_SENSE ? "sensed" : "assumed", BUILD_TAG);
 }
 
 bool logOn = true;
@@ -620,6 +630,7 @@ void handleCommand(String s) {
   } else if (s.startsWith("db2 ")) { DB2 = constrain(s.substring(4).toFloat(), 0.0f, 80.0f); printGains();
   } else if (s.startsWith("dbr ")) { DB_RAMP = constrain(s.substring(4).toFloat(), 4.0f, 80.0f); printGains();
   } else if (s.startsWith("kf "))  { rateAlpha = constrain(s.substring(3).toFloat(), 0.05f, 1.0f); printGains();
+  } else if (s.startsWith("xf "))  { filtVel = s.substring(3).toInt() != 0; printGains();
   } else if (s.startsWith("kvf ")) { velAlpha = constrain(s.substring(4).toFloat(), 0.05f, 1.0f); printGains();
   } else if (s == "p") {
     printGains();
@@ -628,11 +639,19 @@ void handleCommand(String s) {
   } else if (s.startsWith("m ")) {               // bench: both wheels forward for 2 s
     if (mode != IDLE) { Out.println("Stop first (s)."); return; }
     testSteer = 0;
+    testMask = 3;
     testPwm = s.substring(2).toFloat();
+    testUntilMs = millis() + 2000;
+  } else if (s.startsWith("m1 ") || s.startsWith("m2 ")) {   // bench: ONE motor only for 2 s (m1 = motor 1, m2 = motor 2)
+    if (mode != IDLE) { Out.println("Stop first (s)."); return; }
+    testSteer = 0;
+    testMask = (s[1] == '1') ? 1 : 2;
+    testPwm = s.substring(3).toFloat();
     testUntilMs = millis() + 2000;
   } else if (s.startsWith("w ")) {               // bench: spin in place for 2 s (motor 1 fwd, motor 2 rev)
     if (mode != IDLE) { Out.println("Stop first (s)."); return; }
     testPwm = 0;
+    testMask = 3;
     testSteer = s.substring(2).toFloat();
     testUntilMs = millis() + 2000;
   } else if (s.startsWith("kp ")) { kpA = s.substring(3).toFloat(); printGains(); }
@@ -734,7 +753,7 @@ void setup() {
   xTaskCreatePinnedToCore(controlTask, "ctrl", 6144, NULL, 19, NULL, 1);
 
   Serial.println("Commands: pid | lqr (arm) | s (stop) | z (set + save balance point) | cal | auto pid/lqr/off | d <m/s> <deg/s> (drive)");
-  Serial.println("          m <pwm> / w <pwm> (2 s bench tests) | kp/ki/kd/kv/kx <v> | k <Kx> <Kxd> <Kth> <Kthd> | p | log 0/1 | link");
+  Serial.println("          m <pwm> / m1 <pwm> / m2 <pwm> / w <pwm> (2 s bench tests; m1/m2 = one motor) | kp/ki/kd/kv/kx <v> | k <Kx> <Kxd> <Kth> <Kthd> | p | log 0/1 | link");
   Serial.println("          tuning: db1 <v> | db2 <v> | dbr <ramp> | kf <0.05-1> (D filter) | kvf <0.05-1> (speed filter) | rec (record 2 s)");
   Serial.println("          battery: vb (status) | vbat <v> (assumed volts when VBAT_SENSE is false)");
   Serial.println("          balance point: zo <deg> (nudge, live) | zs (save)");
