@@ -4,7 +4,9 @@
 
   Left stick  (X -> GPIO32, Y -> GPIO33): UP/DOWN    = drive forward/back
   Right stick (X -> GPIO39, Y -> GPIO34): LEFT/RIGHT = steer
-  Left stick SEL -> GPIO25 (to GND): emergency stop (robot drops to IDLE, re-arms when held upright again)
+  Button on GPIO14 (to GND): emergency stop (robot drops to IDLE, re-arms when held upright again)
+  Button on GPIO16 (to GND): switch the robot between PID and LQR (press; works live while balancing)
+  The left stick SEL on GPIO25 also still works as an emergency stop (unused pin just reads HIGH, so it does nothing).
   Power the sticks from 3V3. All four axes are on ADC1, so they work with WiFi on.
 
   Serial monitor 115200 baud:
@@ -21,7 +23,9 @@
 // Robot SOFT-AP MAC (printed by the robot at boot: "Robot MAC for the controller: ...")
 uint8_t robotAddress[] = {0x58, 0x2A, 0xBD, 0x7D, 0x17, 0x69};
 
-#define BUTTON_PIN 25                 // left stick SEL, button to GND, internal pull-up
+#define BUTTON_PIN 14                 // emergency stop button, to GND, internal pull-up
+#define STICK_SEL_PIN 25              // left stick SEL, to GND, internal pull-up: also an emergency stop
+#define MODE_BUTTON_PIN 16            // PID <-> LQR button, to GND, internal pull-up. Swap the 14 / 16 here if they are the other way round
 #define ESPNOW_CHANNEL 1              // must match WiFi.softAP(..., channel) on the robot
 
 // ---------------- Configuration ----------------
@@ -54,7 +58,8 @@ Stick sticks[2] = {
 typedef struct control_packet {       // must match the robot's struct exactly
   int16_t throttle;                   // -100..100
   int16_t steering;                   // -100..100
-  bool buttonPressed;
+  bool buttonPressed;                 // emergency stop
+  bool modeButton;                    // PID <-> LQR switch (the robot acts on the rising edge)
 } control_packet;
 
 control_packet pkt;
@@ -122,8 +127,10 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(STICK_SEL_PIN, INPUT_PULLUP);
+  pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
 
-  analogReadResolution(12);                              // 0-4095
+  analogReadResolution(12);                             // 0-4095
   for (int i = 0; i < 2; i++) {
     analogSetPinAttenuation(sticks[i].pinX, ADC_11db);   // full 0-3.3V range
     analogSetPinAttenuation(sticks[i].pinY, ADC_11db);
@@ -176,7 +183,8 @@ void loop() {
   int ste = scaleAxis(y[1], sticks[1].centerY,  INVERT_Y[1]);
   pkt.throttle = INVERT_THROTTLE ? -thr : thr;
   pkt.steering = INVERT_STEER    ? -ste : ste;
-  pkt.buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
+  pkt.buttonPressed = (digitalRead(BUTTON_PIN) == LOW) || (digitalRead(STICK_SEL_PIN) == LOW);
+  pkt.modeButton    = (digitalRead(MODE_BUTTON_PIN) == LOW);
 
   esp_err_t sr = esp_now_send(robotAddress, (uint8_t *)&pkt, sizeof(pkt));
   static uint32_t lastErr = 0;
@@ -188,9 +196,10 @@ void loop() {
   static uint32_t lastRep = 0;
   if (millis() - lastRep > 1000) {
     lastRep = millis();
-    Serial.printf("TX ok=%lu fail=%lu | thr=%d ste=%d btn=%d\n",
+    Serial.printf("TX ok=%lu fail=%lu | thr=%d ste=%d btn=%d mode=%d | rawL=%d cL=%d rawR=%d cR=%d\n",
                   (unsigned long)sentOk, (unsigned long)sentFail,
-                  pkt.throttle, pkt.steering, pkt.buttonPressed);
+                  pkt.throttle, pkt.steering, pkt.buttonPressed, pkt.modeButton,
+                  x[0], sticks[0].centerX, y[1], sticks[1].centerY);
   }
 
   delay(20);                                             // 50 Hz

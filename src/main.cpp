@@ -19,7 +19,23 @@
 //      motor's breakaway can be measured separately. m and w still drive both motors.
 //   8. LQR mode now uses the same low-pass-filtered tilt rate as the PID D term (rateF, command "kf") for the
 //      K[3] term, so PID and LQR see the same rate signal. Set "kf 1" to get the old raw-gyro behaviour.
+//   9. LQR velocity term (K[1]) also uses the filtered tilt rate by default (command "xf 0/1"; xf 0 = old raw-gyro behaviour).
+//      Bench result: with xf 0 every run buzzed; with xf 1 the robot could settle, but the buzz still started.
+//  10. The ~12.5 Hz "buzz" was excess loop gain at that frequency (200 Hz "rec" capture: the tilt rate lagged the command by
+//      about 135 deg). Scaling all gains to 0.7x removed it in bench tests for both modes:
+//        LQR K = [-4.12 -14.42 -29.5 -0.84];  PID kp 20, kd 0.56, kv 20, kx 5.6   (tested with db 0, kf 0.4, xf 1).
+//      These are now the defaults. The old full-gain values are noted next to each gain below.
+//  11. Deadband compensation defaults to DB1 = 8, DB2 = 5: the best of the tested values for the rest buzz (0/0 buzzes most; 12/8 buzzes continuously
+//      and ran away; 25/15 did not stop it at full gain). Do not go above ~8/5 without watching the robot.
+//      The robot still comes to rest inside the dead zone after a nudge (wheels stationary, 1-2 deg off level).
+//  12. Build tag (BUILD_TAG) is printed in the "p" line so the running firmware can be identified from the logs.
+//  13. Controller mode button: a second bool (modeButton) in the ESP-NOW packet. A rising edge switches PID <-> LQR live while
+//      balancing (integrator reset, position reference kept), or selects the auto-arm mode when idle. The old buttonPressed
+//      stays the emergency stop. "sw" does the same from the serial/WiFi terminal. Presses closer than 500 ms are ignored.
+//      The last armed / switched mode is remembered, so auto-arm after an emergency stop resumes in that mode. The "link"
+//      command now shows the mode button state, the current mode and the auto-arm mode.
 //
+
 // Sign conventions (check these on the bench before balancing):
 //   theta  > 0 : robot leaning toward the direction the wheels drive when PWM is positive
 //   x, xdot > 0: robot moving in that same direction
@@ -64,7 +80,8 @@ const float VBAT_DIV     = (100.0f + 47.0f) / 47.0f;   // Vbat = Vpin * VBAT_DIV
 const float VBAT_CAL     = 1.00f;                      // fine trim: measured pack V / reported V (use "vb")
 const float V_TUNE       = 7.2f;                       // battery volts at which gains were tuned AND V_FULL/RPM_FULL measured
 const float MOTOR_V_LIMIT = 6.5f;                      // max average volts allowed at the motors (6 V rated, small margin)
-volatile float vbat = V_TUNE;                          // filtered battery volts
+const float VBAT_ASSUMED = 8.0f;                       // supply volts when not sensing (measured 8.0 V at the buck converter)
+volatile float vbat = VBAT_ASSUMED;                          // filtered battery volts
 
 // ============================== ROBOT CONSTANTS ==============================
 // Power: 2x Li-ion cells (7.2 V nominal, 8.4 V full, ~6 V empty) -> TB6612 -> motors; buck converter -> 5 V for the ESP32.
@@ -79,8 +96,8 @@ const float COUNTS_PER_REV = 341.2f * 4.0f;     // 4x decoding, output shaft
 const float V_FULL         = 6.7f;              // effective motor volts at PWM 255 (ESTIMATE - MEASURE THIS)
 const float RPM_FULL       = 237.0f;            // wheel RPM at PWM 255 on the same battery (ESTIMATE - MEASURE THIS)
 const float KE_FF          = V_FULL / (RPM_FULL * 0.10472f);   // volts per rad/s of wheel speed (back-EMF); ~0.27 expected
-float DB1 = 0.0f;                             // deadband compensation, motor 1 (PWM counts at V_TUNE) - tune with: db1 <v>
-float DB2 = 0.0f;                             // deadband compensation, motor 2 - tune with: db2 <v>
+float DB1 = 8.0f;                             // deadband compensation, motor 1 (PWM counts at V_TUNE) - tune with: db1 <v>. default 8 (see change 11)
+float DB2 = 5.0f;                             // deadband compensation, motor 2 - tune with: db2 <v>. Loaded breakaway measured ~40 (m1) / ~20 (m2) counts
 float DB_RAMP = 70.0f;                          // PWM counts over which the deadband ramps in (bigger = smoother, less gain near 0). dbr <v>
 const bool  INVERT_M2 = true;
 
@@ -105,7 +122,7 @@ const float ARM_MAX_RATE = 20.0f;                // deg/s, must be nearly still 
 
 // ============================== YAW LOOP ==============================
 // Leave OFF until balancing works. Turn on after checking YAW_AXIS / YAW_SIGN with the "w" command.
-const bool YAW_LOOP = false;
+volatile bool yawLoop = false;                   // runtime switch: "yl 1" turns steering on, "yl 0" off
 
 // ============================== AUTO-ARM (starts balancing at power-up) ==============================
 // Arms by itself when the robot is held still at the balance point (the saved one, or the default
@@ -135,18 +152,18 @@ float velF = 0;                                  // filtered wheel angular speed
 
 // ============================== CONTROLLER GAINS ==============================
 // PID mode: angle PD(+I) with an outer velocity/position loop that offsets the angle setpoint.
-// Rule of thumb: kp*kv should be about 900-1000 PWM per (m/s) - it has to beat the motor back-EMF.
-// (PLACEHOLDERS - still to be re-tuned on the robot)
-float kpA = 28.0f;     // PWM counts per degree (at V_TUNE; scaled automatically with battery voltage)
+// These are the 0.7x set that balanced without the 12.5 Hz buzz in bench tests (db 0, kf 0.4). The full-gain set
+// (kp 28, kd 0.8, kv 28, kx 8) buzzed. The old rule of thumb kp*kv = 900-1000 was not needed (here kp*kv = 400).
+float kpA = 20.0f;     // PWM counts per degree (at V_TUNE; scaled automatically with battery voltage)   [was 28]
 float kiA = 0.0f;      // PWM counts per degree-second
-float kdA = 0.8f;      // PWM counts per deg/s
-float kvA = 28.0f;     // degrees of lean per (m/s) of speed error
-float kxA = 8.0f;      // degrees of lean per metre of position error (was 20; lower = less slow rocking)
+float kdA = 0.56f;     // PWM counts per deg/s                                                          [was 0.8]
+float kvA = 20.0f;     // degrees of lean per (m/s) of speed error                                      [was 28]
+float kxA = 5.6f;      // degrees of lean per metre of position error                                   [was 8]
 const float REF_MAX_DEG = 8.0f;
 float rateAlpha = 0.4f;     // D-term low-pass: 1.0 = off, smaller = more filtering. Tune with: kf <0.05..1>
 float rateF = 0;            // filtered tilt rate used by the D term (PID mode)
 volatile bool filtVel = true;   // LQR: use the filtered tilt rate inside the velocity term too (command: xf 0/1)
-#define BUILD_TAG "v10-k07"      // shown in the p line so you can tell which build is running
+#define BUILD_TAG "v16-vb8"      // shown in the p line so you can tell which build is running
 
 // Data recorder: 'rec' captures 2 s at the full control rate, then prints it as CSV
 #define REC_N 400
@@ -155,12 +172,15 @@ volatile int  recIdx = 0;
 volatile bool recActive = false, recDone = false, recStart = false;
 
 // LQR mode: u = -K (z - zref) + feedforward, z = [x (m), xdot (m/s), theta (rad), thetadot (rad/s)], u in volts
-// Gains computed from the physical model (discrete LQR at 200 Hz, Q = diag(50, 5, 100, 1), R = 1 V^2) using:
-//   body mass 0.65 kg, wheels 2 x 11 g, wheel radius 35 mm, axle-to-COM l = 80.2 mm,
-//   body inertia about axle 7.394e-3 kg m^2, motor R = 1.88 ohm, Ke = Kt = 0.27 V s/rad,
-//   reflected rotor inertia 3e-4 kg m^2 per motor (estimate).
-// They assume V_FULL / RPM_FULL above are the measured values. Re-tune live with: k <Kx> <Kxd> <Kth> <Kthd>
-float K[4] = {-4.12f, -14.42f, -29.5f, -0.84f};   // 0.7 x the PID-equivalent gains; stopped the 12.5 Hz buzz in bench tests (with kf 0.4, xf 1, db 0). Old model-based K: {-6.361, -17.280, -21.862, -2.535}
+// The CURRENT gains are NOT from the physical model: they are 0.7 x the gains that make the LQR equal to the PID
+// (K = [-5.88 -20.6 -42.15 -1.204] x 0.7; angle 20 counts/deg ~ 29.5 V/rad, rate 0.56 counts/dps ~ 0.84 V s/rad).
+// They stopped the 12.5 Hz buzz in bench tests (kf 0.4, xf 1, db 0). Units are volts: u = -K (z - zref) + feedforward.
+// The earlier model-based set was K = {-6.361, -17.280, -21.862, -2.535} (discrete LQR at 200 Hz, Q = diag(50, 5, 100, 1),
+// R = 1 V^2; body mass 0.65 kg, wheels 2 x 11 g, wheel radius 35 mm, axle-to-COM 80.2 mm, body inertia about axle 7.394e-3 kg m^2).
+// That model used a wrong COM distance and inertia; the CAD values are Iyy about the axle 2.856e-3 kg m^2 and COM ~47-48.7 mm.
+// A K recomputed with the corrected geometry has NOT been tested on the robot yet.
+// All of them assume V_FULL / RPM_FULL above are the measured values. Re-tune live with: k <Kx> <Kxd> <Kth> <Kthd>
+float K[4] = {-4.12f, -14.42f, -29.5f, -0.84f};
 
 // ============================== WIFI LINK ==============================
 WiFiServer server(23);
@@ -330,13 +350,20 @@ volatile bool  imuOk = false;
 typedef struct control_packet {      // must match the controller's struct exactly
   int16_t throttle;                  // -100..100
   int16_t steering;                  // -100..100
-  bool buttonPressed;
+  bool buttonPressed;                // emergency stop (rising edge)
+  bool modeButton;                   // PID <-> LQR switch (rising edge). sizeof stays 6, so an old controller is NOT rejected:
+                                     // flash the controller with this field too, or modeButton reads a stray padding byte
 } control_packet;
 
 volatile bool lastButton = false;
+volatile bool lastModeButton = false;
+volatile uint32_t lastSwitchMs = 0;
+volatile int  modeSwitchRequest = 0;             // set by the button (ESP-NOW callback) or the "sw" command; handled in controlStep
+volatile int  modeNotice = 0;                    // 1 = now PID, 2 = now LQR, 3 = next arm will be PID, 4 = next arm will be LQR
+const uint32_t SWITCH_MIN_MS = 500;              // ignore presses closer together than this (button bounce / double taps)
 volatile uint32_t rxCount = 0, rxLastMs = 0;     // link diagnostics (print with the "link" command)
 volatile int16_t rxThr = 0, rxSte = 0;
-volatile bool rxBtn = false;
+volatile bool rxBtn = false, rxMode = false;
 
 void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (len != sizeof(control_packet)) return;
@@ -344,7 +371,7 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   memcpy(&p, data, sizeof(p));
 
   rxCount++; rxLastMs = millis();
-  rxThr = p.throttle; rxSte = p.steering; rxBtn = p.buttonPressed;
+  rxThr = p.throttle; rxSte = p.steering; rxBtn = p.buttonPressed; rxMode = p.modeButton;
 
   float t = constrain((int)p.throttle, -100, 100) / 100.0f;
   float s = constrain((int)p.steering, -100, 100) / 100.0f;
@@ -353,9 +380,15 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   lastCmdMs = millis();              // feeds the existing 500 ms link-loss timeout
 
   if (p.buttonPressed && !lastButton) {   // button = emergency stop (rising edge)
-    mode = IDLE; vTarget = 0; yawTarget = 0;
+    mode = IDLE; vTarget = 0; yawTarget = 0; modeSwitchRequest = 0;
   }
   lastButton = p.buttonPressed;
+
+  if (p.modeButton && !lastModeButton && (uint32_t)(millis() - lastSwitchMs) > SWITCH_MIN_MS) {   // rising edge = switch PID <-> LQR
+    lastSwitchMs = millis();
+    if (!p.buttonPressed) modeSwitchRequest = 1;        // never switch while the stop button is held
+  }
+  lastModeButton = p.modeButton;
 }
 
 // ============================== CONTROL STEP (runs at CTRL_HZ) ==============================
@@ -459,14 +492,24 @@ void controlStep() {
       vRef = 0; yawRef = 0; xRef = 0;
       xOffset = xAbs;
       mode = (req == 1) ? PID_MODE : LQR_MODE;
+      autoArmMode = req;                          // remember the last armed mode for re-arming after a stop
       armReply = 1;
     }
+  }
+  // ---- 3b. PID <-> LQR switch (button or "sw"): live while balancing, or selects the next auto-arm mode when idle ----
+  if (modeSwitchRequest) {
+    modeSwitchRequest = 0;
+    // x offset, xRef and the filters carry over, so the hand-over is smooth. autoArmMode follows, so after an emergency
+    // stop the robot re-arms in the mode you were last using instead of falling back to the boot default.
+    if (mode == PID_MODE)      { mode = LQR_MODE; pidInt = 0; autoArmMode = 2; modeNotice = 2; }
+    else if (mode == LQR_MODE) { mode = PID_MODE; pidInt = 0; autoArmMode = 1; modeNotice = 1; }
+    else                       { autoArmMode = (autoArmMode == 1) ? 2 : 1; modeNotice = (autoArmMode == 1) ? 3 : 4; }
   }
   float x  = xAbs - xOffset;
   xPos = x; xVel = xdAbs;
 
   // ---- 4. safety cutoff ----
-  if (mode != IDLE && (fabsf(theta) > CUTOFF_DEG || (YAW_LOOP && fabsf(yawRate) > YAW_CUTOFF))) {
+  if (mode != IDLE && (fabsf(theta) > CUTOFF_DEG || (yawLoop && fabsf(yawRate) > YAW_CUTOFF))) {
     mode = IDLE;
     cutoffFlag = true;
   }
@@ -512,7 +555,7 @@ void controlStep() {
 
   // ---- 7. yaw-rate loop (steering; also holds the robot straight when yawRef = 0) ----
   float steer = 0;
-  if (mode != IDLE && YAW_LOOP) {
+  if (mode != IDLE && yawLoop) {
     float yawErr = yawRef - yawRate;
     float steerMax = fminf(STEER_MAX, pwmLimit - fabsf(pwmCmd));   // balance has priority over turning
     if (steerMax < 0) steerMax = 0;
@@ -555,8 +598,8 @@ void controlTask(void *) {
 
 // ============================== COMMANDS ==============================
 void printGains() {
-  Out.printf("PID: kp=%.2f ki=%.2f kd=%.2f kv=%.2f kx=%.2f | LQR K=[%.4f %.4f %.4f %.4f] | zero=%.2f deg | DB1=%.0f DB2=%.0f dbr=%.0f kf=%.2f kvf=%.2f xf=%d | vbat=%.2f (%s) | build %s\n",
-             kpA, kiA, kdA, kvA, kxA, K[0], K[1], K[2], K[3], (float)angleZero, DB1, DB2, DB_RAMP, rateAlpha, velAlpha, (int)filtVel,
+  Out.printf("PID: kp=%.2f ki=%.2f kd=%.2f kv=%.2f kx=%.2f | LQR K=[%.4f %.4f %.4f %.4f] | zero=%.2f deg | DB1=%.0f DB2=%.0f dbr=%.0f kf=%.2f kvf=%.2f xf=%d yl=%d | vbat=%.2f (%s) | build %s\n",
+             kpA, kiA, kdA, kvA, kxA, K[0], K[1], K[2], K[3], (float)angleZero, DB1, DB2, DB_RAMP, rateAlpha, velAlpha, (int)filtVel, (int)yawLoop,
              (float)vbat, VBAT_SENSE ? "sensed" : "assumed", BUILD_TAG);
 }
 
@@ -578,8 +621,10 @@ void handleCommand(String s) {
   } else if (s == "pid" || s == "lqr") {
     armReply = 0;
     armRequest = (s == "pid") ? 1 : 2;
+  } else if (s == "sw") {                          // same as the controller's mode button
+    modeSwitchRequest = 1;
   } else if (s == "s") {
-    mode = IDLE; testUntilMs = 0; vTarget = 0; yawTarget = 0;
+    mode = IDLE; testUntilMs = 0; vTarget = 0; yawTarget = 0; modeSwitchRequest = 0;
     autoArm = false;
     Out.println("Stopped. Auto-arm is OFF (send: auto pid / auto lqr to re-enable).");
   } else if (s == "z") {
@@ -612,9 +657,9 @@ void handleCommand(String s) {
     zeroSaved = true;
     Out.println("Balance point saved.");
   } else if (s == "link") {                        // ESP-NOW remote diagnostics
-    Out.printf("LINK: rx=%lu age=%lu ms thr=%d ste=%d btn=%d vTarget=%.3f yawTarget=%.1f\n",
+    Out.printf("LINK: rx=%lu age=%lu ms thr=%d ste=%d btn=%d modebtn=%d vTarget=%.3f yawTarget=%.1f | mode=%d autoArmMode=%d\n",
                (unsigned long)rxCount, (unsigned long)(millis() - rxLastMs),
-               (int)rxThr, (int)rxSte, (int)rxBtn, (float)vTarget, (float)yawTarget);
+               (int)rxThr, (int)rxSte, (int)rxBtn, (int)rxMode, (float)vTarget, (float)yawTarget, (int)mode, autoArmMode);
   } else if (s == "rec") {
     recStart = true;
     Out.println("Recording 2 s at 200 Hz (keep it balancing)...");
@@ -630,6 +675,7 @@ void handleCommand(String s) {
   } else if (s.startsWith("db2 ")) { DB2 = constrain(s.substring(4).toFloat(), 0.0f, 80.0f); printGains();
   } else if (s.startsWith("dbr ")) { DB_RAMP = constrain(s.substring(4).toFloat(), 4.0f, 80.0f); printGains();
   } else if (s.startsWith("kf "))  { rateAlpha = constrain(s.substring(3).toFloat(), 0.05f, 1.0f); printGains();
+  } else if (s.startsWith("yl "))  { yawLoop = s.substring(3).toInt() != 0; printGains();
   } else if (s.startsWith("xf "))  { filtVel = s.substring(3).toInt() != 0; printGains();
   } else if (s.startsWith("kvf ")) { velAlpha = constrain(s.substring(4).toFloat(), 0.05f, 1.0f); printGains();
   } else if (s == "p") {
@@ -754,9 +800,10 @@ void setup() {
 
   Serial.println("Commands: pid | lqr (arm) | s (stop) | z (set + save balance point) | cal | auto pid/lqr/off | d <m/s> <deg/s> (drive)");
   Serial.println("          m <pwm> / m1 <pwm> / m2 <pwm> / w <pwm> (2 s bench tests; m1/m2 = one motor) | kp/ki/kd/kv/kx <v> | k <Kx> <Kxd> <Kth> <Kthd> | p | log 0/1 | link");
-  Serial.println("          tuning: db1 <v> | db2 <v> | dbr <ramp> | kf <0.05-1> (D filter) | kvf <0.05-1> (speed filter) | rec (record 2 s)");
+  Serial.println("          tuning: db1 <v> | db2 <v> | dbr <ramp> | kf <0.05-1> (D filter) | kvf <0.05-1> (speed filter) | xf 0/1 (LQR velocity term uses filtered rate) | rec (record 2 s)");
   Serial.println("          battery: vb (status) | vbat <v> (assumed volts when VBAT_SENSE is false)");
   Serial.println("          balance point: zo <deg> (nudge, live) | zs (save)");
+  Serial.println("          mode switch: sw (or the controller's mode button) toggles PID <-> LQR, live while balancing");
   Serial.println("CSV: t_ms,mode,theta_deg,rate_dps,x_m,xdot_mps,vref_mps,pwm,yaw_dps,period_us_min,period_us_max,loop_us_max,vbat");
 }
 
@@ -774,6 +821,13 @@ void loop() {
     if (r == 1)      Out.println("ARMED.");
     else if (r == 2) Out.println("Not armed: too far from the balance point (hold it upright, send z first).");
     else if (r == 3) Out.println("Not armed: robot is moving - hold it still.");
+  }
+  if (modeNotice) {
+    int n = modeNotice; modeNotice = 0;
+    if (n == 1)      Out.println("MODE: PID");
+    else if (n == 2) Out.println("MODE: LQR");
+    else if (n == 3) Out.println("Idle: next auto-arm / arm will use PID.");
+    else             Out.println("Idle: next auto-arm will use LQR.");
   }
   if (cutoffFlag) { cutoffFlag = false; Out.println("CUTOFF: tilt/yaw limit exceeded, motors stopped."); }
   if (faultFlag)  { faultFlag = false;  Out.println("FAULT: IMU read failed, motors stopped."); }
